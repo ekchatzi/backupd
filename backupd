@@ -35,6 +35,10 @@ def load_env_file(env_path):
             if not line or line.startswith('#'):
                 continue
 
+            # Remove 'export ' prefix if present
+            if line.startswith('export '):
+                line = line[7:].strip()
+
             # Parse KEY=VALUE format
             match = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$', line)
             if match:
