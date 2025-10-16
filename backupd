@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""
+Backupd - A flexible backup solution for databases and directories
+Supports MySQL dumps with retention policies and rsync directory backups
+"""
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+# Global state for loaded configurations
+env_vars = {}
+json_files = {}
+
+
+def load_env_file(env_path):
+    """Load environment variables from a .env file"""
+    vars_dict = {}
+
+    if not os.path.exists(env_path):
+        return vars_dict
+
+    with open(env_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            # Skip comments and empty lines
+            if not line or line.startswith('#'):
+                continue
+
+            # Parse KEY=VALUE format
+            match = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$', line)
+            if match:
+                key, value = match.groups()
+                # Remove quotes if present
+                value = value.strip()
+                if (value.startswith('"') and value.endswith('"')) or \
+                   (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+                vars_dict[key] = value
+
+    return vars_dict
+
+
+def load_json_file(json_path):
+    """Load a JSON credentials file"""
+    if not os.path.exists(json_path):
+        raise Exception(f"JSON file not found: {json_path}")
+
+    with open(json_path, 'r') as f:
+        return json.load(f)
+
+
+def get_nested_value(data, key_path):
+    """Get a nested value from a dict using dot notation"""
+    keys = key_path.split('.')
+    value = data
+
+    for key in keys:
+        if isinstance(value, dict) and key in value:
+            value = value[key]
+        else:
+            raise Exception(f"Key path '{key_path}' not found in JSON data")
+
+    return value
+
+
+def resolve_placeholder(text, base_dir="."):
+    """Resolve placeholders in a string"""
+    if not isinstance(text, str):
+        return text
+
+    # Resolve {env.VARIABLE} placeholders
+    def resolve_env(match):
+        var_name = match.group(1)
+        if var_name in env_vars:
+            return env_vars[var_name]
+        # Also check system environment
+        if var_name in os.environ:
+            return os.environ[var_name]
+        raise Exception(f"Environment variable not found: {var_name}")
+
+    text = re.sub(r'\{env\.([A-Za-z_][A-Za-z0-9_]*)\}', resolve_env, text)
+
+    # Resolve {file.jsonname.key.path} placeholders
+    def resolve_file(match):
+        parts = match.group(1).split('.', 1)
+        if len(parts) < 2:
+            raise Exception(f"Invalid file placeholder format: {match.group(0)}")
+
+        json_filename = parts[0]
+        key_path = parts[1]
+
+        # Load JSON file if not already loaded
+        if json_filename not in json_files:
+            json_path = os.path.join(base_dir, f"{json_filename}.json")
+            json_files[json_filename] = load_json_file(json_path)
+
+        json_data = json_files[json_filename]
+        return str(get_nested_value(json_data, key_path))
+
+    text = re.sub(r'\{file\.([^}]+)\}', resolve_file, text)
+
+    # Resolve {hostname} placeholder
+    hostname = socket.gethostname()
+    text = text.replace('{hostname}', hostname)
+
+    # Resolve {datetime} and similar time placeholders
+    now = datetime.now()
+    text = text.replace('{datetime}', now.strftime('%Y%m%d_%H%M%S'))
+    text = text.replace('{date}', now.strftime('%Y%m%d'))
+    text = text.replace('{time}', now.strftime('%H%M%S'))
+    text = text.replace('{year}', now.strftime('%Y'))
+    text = text.replace('{month}', now.strftime('%m'))
+    text = text.replace('{day}', now.strftime('%d'))
+
+    return text
+
+
+def parse_rsync_target(target):
+    """Parse rsync target and return (host, port, user, path, is_remote, ssh_style)"""
+    # rsync://user@host:port/path format
+    rsync_match = re.match(r'^rsync://(?:([^@]+)@)?([^:/]+)(?::(\d+))?(/.*)?$', target)
+    if rsync_match:
+        user, host, port, path = rsync_match.groups()
+        port = int(port) if port else 22
+        path = path or '/'
+        return (host, port, user, path, True, False)
+
+    # user@host:/path or host:/path format (SSH-style)
+    ssh_match = re.match(r'^(?:([^@]+)@)?([^:]+):(.*)$', target)
+    if ssh_match:
+        user, host, path = ssh_match.groups()
+        return (host, 22, user, path, True, True)
+
+    # Local path
+    return (None, None, None, target, False, False)
+
+
+def build_rsync_command(source, target, options=None, verbose=False):
+    """Build rsync command with proper SSH handling"""
+    options = options or []
+    host, port, user, path, is_remote, ssh_style = parse_rsync_target(target)
+
+    rsync_cmd = ['rsync', '-a', '--mkpath']
+
+    if is_remote and ssh_style:
+        # SSH-style: user@host:/path
+        if port != 22:
+            rsync_cmd.extend(['-e', f'ssh -p {port}'])
+
+        if user:
+            full_target = f"{user}@{host}:{path}"
+        else:
+            full_target = f"{host}:{path}"
+    elif is_remote and not ssh_style:
+        # rsync:// protocol - convert to SSH style
+        if verbose:
+            print(f"  Note: Converting rsync:// to SSH-style rsync")
+
+        if port != 22:
+            rsync_cmd.extend(['-e', f'ssh -p {port}'])
+
+        if user:
+            full_target = f"{user}@{host}:{path}"
+        else:
+            full_target = f"{host}:{path}"
+    else:
+        # Local
+        full_target = target
+
+    rsync_cmd.extend(options)
+    rsync_cmd.extend([source, full_target])
+
+    return rsync_cmd
+
+
+def list_remote_files(target, pattern="*.sql.gz", verbose=False):
+    """List files on remote target via SSH"""
+    host, port, user, path, is_remote, _ = parse_rsync_target(target)
+
+    if not is_remote:
+        # Local path - use glob
+        files = []
+        for filepath in Path(target).glob(pattern):
+            stat = filepath.stat()
+            files.append({
+                'name': filepath.name,
+                'path': str(filepath),
+                'mtime': datetime.fromtimestamp(stat.st_mtime),
+                'size': stat.st_size
+            })
+        return files
+
+    # Remote path - use SSH ls
+    ssh_cmd = ['ssh']
+
+    if port != 22:
+        ssh_cmd.extend(['-p', str(port)])
+
+    if user:
+        ssh_host = f"{user}@{host}"
+    else:
+        ssh_host = host
+
+    ssh_cmd.append(ssh_host)
+
+    # Use find command to get files with timestamps
+    # Format: mtime filename (seconds since epoch)
+    find_cmd = f"find {path} -maxdepth 1 -name '{pattern}' -type f -printf '%T@ %f\\n' 2>/dev/null || true"
+    ssh_cmd.append(find_cmd)
+
+    if verbose:
+        print(f"  Listing remote files: {' '.join(ssh_cmd)}")
+
+    result = subprocess.run(
+        ssh_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if result.returncode != 0:
+        if verbose:
+            print(f"  Warning: Failed to list remote files: {result.stderr}")
+        return []
+
+    files = []
+    for line in result.stdout.strip().split('\n'):
+        if not line:
+            continue
+
+        parts = line.split(' ', 1)
+        if len(parts) == 2:
+            mtime_str, filename = parts
+            try:
+                mtime = datetime.fromtimestamp(float(mtime_str))
+                files.append({
+                    'name': filename,
+                    'path': f"{path}/{filename}" if not path.endswith('/') else f"{path}{filename}",
+                    'mtime': mtime,
+                    'size': 0  # We don't get size from find by default
+                })
+            except (ValueError, OSError):
+                continue
+
+    return files
+
+
+def delete_remote_file(target, filename, verbose=False):
+    """Delete a file on remote target via SSH"""
+    host, port, user, path, is_remote, _ = parse_rsync_target(target)
+
+    if not is_remote:
+        # Local path
+        filepath = Path(target) / filename
+        if verbose:
+            print(f"  Deleting: {filepath}")
+        try:
+            filepath.unlink()
+            return True
+        except Exception as e:
+            print(f"  Warning: Failed to delete {filepath}: {e}", file=sys.stderr)
+            return False
+
+    # Remote path - use SSH rm
+    ssh_cmd = ['ssh']
+
+    if port != 22:
+        ssh_cmd.extend(['-p', str(port)])
+
+    if user:
+        ssh_host = f"{user}@{host}"
+    else:
+        ssh_host = host
+
+    ssh_cmd.append(ssh_host)
+
+    file_path = f"{path}/{filename}" if not path.endswith('/') else f"{path}{filename}"
+    ssh_cmd.append(f"rm -f {file_path}")
+
+    if verbose:
+        print(f"  Deleting remote: {filename}")
+
+    result = subprocess.run(
+        ssh_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if result.returncode != 0:
+        print(f"  Warning: Failed to delete {filename}: {result.stderr}", file=sys.stderr)
+        return False
+
+    return True
+
+
+def parse_interval(interval_str):
+    """Parse interval string like '1D', '1W', '1M', '1Y'"""
+    match = re.match(r'^(\d+)([DWMY])$', interval_str)
+    if not match:
+        raise Exception(f"Invalid interval format: {interval_str}")
+
+    count, unit = match.groups()
+    count = int(count)
+
+    if unit == 'D':
+        return timedelta(days=count)
+    elif unit == 'W':
+        return timedelta(weeks=count)
+    elif unit == 'M':
+        return timedelta(days=count * 30)  # Approximate
+    elif unit == 'Y':
+        return timedelta(days=count * 365)  # Approximate
+    else:
+        raise Exception(f"Unknown interval unit: {unit}")
+
+
+def apply_retention(target_dir, policy, pattern="*.sql.gz", verbose=False):
+    """Apply retention policy to backup files (local or remote)"""
+    # Get all backup files with their timestamps
+    files = list_remote_files(target_dir, pattern, verbose)
+
+    if not files:
+        if verbose:
+            print(f"  No files found matching pattern: {pattern}")
+        return
+
+    # Sort by date (newest first)
+    files.sort(key=lambda x: x['mtime'], reverse=True)
+
+    if verbose:
+        print(f"  Found {len(files)} backup files")
+
+    # Determine which files to keep
+    files_to_keep = set()
+
+    for policy_item in policy:
+        interval_str = policy_item['interval']
+        count = policy_item['count']
+        interval = parse_interval(interval_str)
+
+        kept_in_interval = 0
+        last_kept = None
+
+        for file_info in files:
+            file_date = file_info['mtime']
+
+            # Check if file is within this policy's time range
+            if kept_in_interval < count:
+                # For this interval, keep one per interval period
+                if last_kept is None or (last_kept - file_date) >= interval:
+                    files_to_keep.add(file_info['name'])
+                    last_kept = file_date
+                    kept_in_interval += 1
+
+    if verbose:
+        print(f"  Keeping {len(files_to_keep)} files, deleting {len(files) - len(files_to_keep)}")
+
+    # Delete files not in keep set
+    for file_info in files:
+        if file_info['name'] not in files_to_keep:
+            delete_remote_file(target_dir, file_info['name'], verbose)
+
+
+def backup_mysql(config, verbose=False, dry_run=False):
+    """Perform MySQL backup"""
+    try:
+        # Resolve all configuration values
+        db_host = resolve_placeholder(config.get('db_host', 'localhost'))
+        db_user = resolve_placeholder(config['db_user'])
+        db_password = resolve_placeholder(config['db_password'])
+        db_database = resolve_placeholder(config['db_database'])
+        target = resolve_placeholder(config['target'])
+        compress = config.get('compress', 'gzip')
+
+        if verbose:
+            print(f"\nMySQL Backup: {db_database}@{db_host}")
+            print(f"  Target: {target}")
+
+        if dry_run:
+            print("  [DRY RUN] Would perform backup")
+            return True
+
+        # Generate filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{db_database}_{timestamp}.sql"
+
+        # Create temporary file for dump
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dump_path = os.path.join(tmpdir, filename)
+            compressed_path = f"{dump_path}.gz"
+
+            # Run mysqldump
+            if verbose:
+                print(f"  Dumping database...")
+
+            mysqldump_cmd = [
+                'mysqldump',
+                f'-h{db_host}',
+                f'-u{db_user}',
+                f'-p{db_password}',
+                '--single-transaction',
+                '--quick',
+                '--lock-tables=false',
+                db_database
+            ]
+
+            with open(dump_path, 'w') as f:
+                result = subprocess.run(
+                    mysqldump_cmd,
+                    stdout=f,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+
+            if result.returncode != 0:
+                raise Exception(f"mysqldump failed: {result.stderr}")
+
+            # Compress
+            if compress == 'gzip':
+                if verbose:
+                    print(f"  Compressing...")
+
+                with open(dump_path, 'rb') as f_in:
+                    result = subprocess.run(
+                        ['gzip', '-c'],
+                        stdin=f_in,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+
+                if result.returncode != 0:
+                    raise Exception(f"gzip failed: {result.stderr.decode()}")
+
+                with open(compressed_path, 'wb') as f_out:
+                    f_out.write(result.stdout)
+
+                final_path = compressed_path
+            else:
+                final_path = dump_path
+
+            # Rsync to target
+            if verbose:
+                print(f"  Uploading to {target}...")
+
+            rsync_cmd = build_rsync_command(final_path, target, verbose=verbose)
+
+            if verbose:
+                print(f"  Running: {' '.join(rsync_cmd)}")
+
+            result = subprocess.run(
+                rsync_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            if result.returncode != 0:
+                raise Exception(f"rsync failed: {result.stderr}")
+
+            if verbose:
+                print(f"  Backup completed: {os.path.basename(final_path)}")
+
+        # Apply retention policy if specified
+        if 'previous_versions' in config:
+            if verbose:
+                print(f"  Applying retention policy...")
+
+            apply_retention(
+                target,
+                config['previous_versions'],
+                pattern=f"{db_database}_*.sql.gz",
+                verbose=verbose
+            )
+
+        return True
+
+    except Exception as e:
+        print(f"Error backing up MySQL database: {e}", file=sys.stderr)
+        return False
+
+
+def backup_directory(config, verbose=False, dry_run=False):
+    """Perform directory backup via rsync"""
+    try:
+        source = resolve_placeholder(config['source'])
+        target = resolve_placeholder(config['target'])
+        options = config.get('options', [])
+
+        if verbose:
+            print(f"\nDirectory Backup: {source}")
+            print(f"  Target: {target}")
+            print(f"  Options: {' '.join(options)}")
+
+        if dry_run:
+            print("  [DRY RUN] Would perform rsync")
+            return True
+
+        # Build rsync command
+        rsync_cmd = build_rsync_command(source, target, options, verbose=verbose)
+
+        if verbose:
+            print(f"  Running: {' '.join(rsync_cmd)}")
+
+        result = subprocess.run(
+            rsync_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        if result.returncode != 0:
+            raise Exception(f"rsync failed: {result.stderr}")
+
+        if verbose:
+            print(f"  Backup completed successfully")
+
+        return True
+
+    except Exception as e:
+        print(f"Error backing up directory: {e}", file=sys.stderr)
+        return False
+
+
+def run_backups(config_path, verbose=False, dry_run=False):
+    """Run all backup jobs"""
+    global env_vars, json_files
+
+    try:
+        # Load configuration
+        if not os.path.exists(config_path):
+            raise Exception(f"Configuration file not found: {config_path}")
+
+        if verbose:
+            print(f"Loading configuration from {config_path}")
+
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+
+        if not isinstance(config, list):
+            raise Exception("Configuration must be a JSON array of backup jobs")
+
+        if verbose:
+            print(f"Found {len(config)} backup job(s)")
+
+        # Track success/failure
+        successful = 0
+        failed = 0
+
+        # Process each backup job
+        for idx, job in enumerate(config, 1):
+            backup_type = job.get('type')
+
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Job {idx}/{len(config)}: {backup_type}")
+                print(f"{'='*60}")
+
+            # Load env file if specified
+            if 'env' in job:
+                env_path = resolve_placeholder(job['env'])
+                if verbose:
+                    print(f"Loading environment from: {env_path}")
+                loaded_env = load_env_file(env_path)
+                env_vars.update(loaded_env)
+
+            # Execute appropriate backup handler
+            success = False
+
+            if backup_type == 'mysql':
+                success = backup_mysql(job, verbose, dry_run)
+            elif backup_type == 'directory':
+                success = backup_directory(job, verbose, dry_run)
+            else:
+                print(f"Unknown backup type: {backup_type}", file=sys.stderr)
+                failed += 1
+                continue
+
+            if success:
+                successful += 1
+            else:
+                failed += 1
+
+        # Summary
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Backup Summary")
+            print(f"{'='*60}")
+            print(f"Successful: {successful}")
+            print(f"Failed: {failed}")
+            print(f"Total: {len(config)}")
+
+        return 0 if failed == 0 else 1
+
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        return 1
+
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(
+        description='Backupd - Flexible backup solution for databases and directories',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                    # Run backups using ./backup.json
+  %(prog)s -c /etc/backup.json # Run backups using custom config
+  %(prog)s -v                 # Run with verbose output
+  %(prog)s --dry-run          # Test configuration without executing
+        """
+    )
+
+    parser.add_argument(
+        '-c', '--config',
+        default='backup.json',
+        help='Path to backup configuration file (default: backup.json)'
+    )
+
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose output'
+    )
+
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Test configuration without executing backups'
+    )
+
+    args = parser.parse_args()
+
+    # Run backups
+    exit_code = run_backups(
+        config_path=args.config,
+        verbose=args.verbose,
+        dry_run=args.dry_run
+    )
+
+    sys.exit(exit_code)
+
+
+if __name__ == '__main__':
+    main()

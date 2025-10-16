@@ -1,0 +1,60 @@
+[
+    {
+        "comment": "MySQL database backup with retention policy",
+        "env": "./.env",
+        "type": "mysql",
+        "db_user": "{env.DB_USERNAME}",
+        "db_password": "{env.DB_PASSWORD}",
+        "db_host": "{env.DB_SERVER}",
+        "db_database": "{env.DB_DATABASE}",
+        "target": "/backups/db/{hostname}/",
+        "compress": "gzip",
+        "previous_versions": [
+            {
+                "interval": "1D",
+                "count": 14
+            },
+            {
+                "interval": "1W",
+                "count": 8
+            },
+            {
+                "interval": "1M",
+                "count": 6
+            },
+            {
+                "interval": "1Y",
+                "count": 2
+            }
+        ]
+    },
+    {
+        "comment": "Directory backup via rsync",
+        "type": "directory",
+        "source": "/var/www/uploads/",
+        "target": "/backups/files/",
+        "options": [
+            "--delete",
+            "--exclude=*.tmp"
+        ]
+    },
+    {
+        "comment": "Remote rsync backup to storage box",
+        "type": "directory",
+        "source": "./data/",
+        "target": "rsync://user@backup-server.com:23/project/data/",
+        "options": [
+            "--delete"
+        ]
+    },
+    {
+        "comment": "Database backup with credentials from JSON file",
+        "type": "mysql",
+        "db_user": "{file.credentials.db.username}",
+        "db_password": "{file.credentials.db.password}",
+        "db_host": "localhost",
+        "db_database": "myapp",
+        "target": "/backups/myapp/",
+        "compress": "gzip"
+    }
+]
