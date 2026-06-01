@@ -5,6 +5,7 @@ Supports MySQL dumps with retention policies and rsync directory backups
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -186,74 +187,102 @@ def build_rsync_command(source, target, options=None, verbose=False):
     return rsync_cmd
 
 
+def parse_timestamp_from_filename(filename):
+    """Extract the YYYYMMDD_HHMMSS timestamp that backupd embeds in dump filenames.
+    Returns a datetime, or None if no parseable timestamp is present.
+
+    The timestamp is anchored to the extension boundary (it precedes a '.'), so a db name
+    that itself contains an 8+6 digit run can't be mistaken for the backup timestamp."""
+    match = re.search(r'(\d{8}_\d{6})(?=\.)', filename)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), '%Y%m%d_%H%M%S')
+    except ValueError:
+        return None
+
+
+def run_sftp_batch(host, port, user, commands, verbose=False):
+    """Run a batch of sftp commands from this machine against the remote target.
+
+    Uses SFTP (not ssh command execution), so it works against restricted storage
+    backends such as the Hetzner Storage Box, which serve SFTP but do not allow
+    arbitrary shell commands like `find`. Commands prefixed with '-' do not abort
+    the batch on error (sftp batch-mode convention)."""
+    ssh_host = f"{user}@{host}" if user else host
+    # accept-new: trust a not-yet-known host key on first contact (so the first unattended
+    # run isn't blocked) but still refuse a CHANGED key (MITM protection). -b implies batch
+    # mode, so it never hangs on a prompt — a key problem fails with rc!=0 instead.
+    sftp_cmd = ['sftp', '-o', 'StrictHostKeyChecking=accept-new']
+    if port and port != 22:
+        sftp_cmd += ['-P', str(port)]
+    sftp_cmd += ['-b', '-', ssh_host]
+    batch_input = '\n'.join(commands) + '\n'
+    if verbose:
+        print(f"  sftp {ssh_host} (port {port}): {commands}")
+    return subprocess.run(
+        sftp_cmd,
+        input=batch_input,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+
 def list_remote_files(target, pattern="*.sql.gz", verbose=False):
-    """List files on remote target via SSH"""
+    """List backup files (local or remote) matching pattern, each with a timestamp.
+
+    Timestamps come from the filename (the {datetime} backupd embeds), which is more
+    reliable and portable than remote mtimes. Remote listing uses SFTP server-side, so
+    it works on backends that forbid arbitrary ssh commands (e.g. Hetzner Storage Box)."""
     host, port, user, path, is_remote, _ = parse_rsync_target(target)
 
     if not is_remote:
         # Local path - use glob
         files = []
         for filepath in Path(target).glob(pattern):
-            stat = filepath.stat()
+            if not filepath.is_file():
+                continue
+            # Only manage files that carry the embedded backup timestamp. Real dumps
+            # always do; anything else is left untouched (never counted, never deleted).
+            mtime = parse_timestamp_from_filename(filepath.name)
+            if mtime is None:
+                continue
             files.append({
                 'name': filepath.name,
                 'path': str(filepath),
-                'mtime': datetime.fromtimestamp(stat.st_mtime),
-                'size': stat.st_size
+                'mtime': mtime,
             })
         return files
 
-    # Remote path - use SSH ls
-    ssh_cmd = ['ssh']
-
-    if port != 22:
-        ssh_cmd.extend(['-p', str(port)])
-
-    if user:
-        ssh_host = f"{user}@{host}"
-    else:
-        ssh_host = host
-
-    ssh_cmd.append(ssh_host)
-
-    # Use find command to get files with timestamps
-    # Format: mtime filename (seconds since epoch)
-    find_cmd = f"find {path} -maxdepth 1 -name '{pattern}' -type f -printf '%T@ %f\\n' 2>/dev/null || true"
-    ssh_cmd.append(find_cmd)
-
-    if verbose:
-        print(f"  Listing remote files: {' '.join(ssh_cmd)}")
-
-    result = subprocess.run(
-        ssh_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
+    # Remote path - list via SFTP (portable; no dependency on remote shell commands)
+    result = run_sftp_batch(host, port, user, [f"ls -1 {path}"], verbose=verbose)
 
     if result.returncode != 0:
-        if verbose:
-            print(f"  Warning: Failed to list remote files: {result.stderr}")
+        # Fail LOUD (not verbose-only): a swallowed listing failure silently stops pruning
+        # and lets the store keep filling. cron captures stderr.
+        print(f"  WARNING: remote backup listing failed — retention SKIPPED, store will keep "
+              f"growing: {result.stderr.strip()}", file=sys.stderr)
         return []
 
     files = []
-    for line in result.stdout.strip().split('\n'):
-        if not line:
+    for line in result.stdout.splitlines():
+        name = line.strip().rstrip('/')
+        if not name:
             continue
-
-        parts = line.split(' ', 1)
-        if len(parts) == 2:
-            mtime_str, filename = parts
-            try:
-                mtime = datetime.fromtimestamp(float(mtime_str))
-                files.append({
-                    'name': filename,
-                    'path': f"{path}/{filename}" if not path.endswith('/') else f"{path}{filename}",
-                    'mtime': mtime,
-                    'size': 0  # We don't get size from find by default
-                })
-            except (ValueError, OSError):
-                continue
+        # sftp may print full paths and/or echo the command; reduce to a basename and
+        # keep only entries that match the pattern AND carry a parseable timestamp.
+        name = name.split('/')[-1]
+        if not fnmatch.fnmatch(name, pattern):
+            continue
+        mtime = parse_timestamp_from_filename(name)
+        if mtime is None:
+            continue
+        files.append({
+            'name': name,
+            'path': f"{path}/{name}" if not path.endswith('/') else f"{path}{name}",
+            'mtime': mtime,
+        })
 
     return files
 
@@ -305,6 +334,51 @@ def delete_remote_file(target, filename, verbose=False):
         return False
 
     return True
+
+
+def delete_remote_files(target, filenames, verbose=False):
+    """Delete the given backup files (local or remote). Remote deletion runs as a single
+    SFTP batch session — efficient for catch-up pruning and portable across backends."""
+    if not filenames:
+        return
+
+    # SFTP batch `rm` glob-expands and word-splits its argument server-side, so a name with a
+    # glob metacharacter or whitespace could delete files we must keep (e.g. `*` matching the
+    # newest backup). backupd only ever writes clean `{db}_<ts>.sql.gz` names, so any such name
+    # is foreign/corrupt — refuse to delete it and report it loudly.
+    safe_names = []
+    for name in filenames:
+        if any(c in name for c in '*?[]\\ \t\n'):
+            print(f"  Skipping unsafe filename (glob/whitespace), NOT deleting: {name}", file=sys.stderr)
+            continue
+        safe_names.append(name)
+    if not safe_names:
+        return
+    filenames = safe_names
+
+    host, port, user, path, is_remote, _ = parse_rsync_target(target)
+
+    if not is_remote:
+        for name in filenames:
+            filepath = Path(target) / name
+            try:
+                filepath.unlink()
+                if verbose:
+                    print(f"  Deleted: {filepath}")
+            except Exception as e:
+                print(f"  Warning: Failed to delete {filepath}: {e}", file=sys.stderr)
+        return
+
+    # Remote: one sftp session; '-rm' so a single missing file doesn't abort the batch.
+    commands = []
+    for name in filenames:
+        file_path = f"{path}/{name}" if not path.endswith('/') else f"{path}{name}"
+        commands.append(f"-rm {file_path}")
+    result = run_sftp_batch(host, port, user, commands, verbose=verbose)
+    if verbose:
+        print(f"  Requested deletion of {len(filenames)} remote file(s)")
+    if result.returncode != 0 and verbose:
+        print(f"  Note: sftp delete reported: {result.stderr.strip()}")
 
 
 def parse_interval(interval_str):
@@ -369,10 +443,9 @@ def apply_retention(target_dir, policy, pattern="*.sql.gz", verbose=False):
     if verbose:
         print(f"  Keeping {len(files_to_keep)} files, deleting {len(files) - len(files_to_keep)}")
 
-    # Delete files not in keep set
-    for file_info in files:
-        if file_info['name'] not in files_to_keep:
-            delete_remote_file(target_dir, file_info['name'], verbose)
+    # Delete files not in keep set (batched into a single sftp session for remote targets)
+    to_delete = [f['name'] for f in files if f['name'] not in files_to_keep]
+    delete_remote_files(target_dir, to_delete, verbose)
 
 
 def backup_mysql(config, verbose=False, dry_run=False):
